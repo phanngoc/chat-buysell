@@ -88,6 +88,11 @@ func main() {
 	r.GET("/search/chat", handleSearchChat)
 	r.POST("/chat/classify", handleClassifyMessage)
 
+	// Matching routes
+	r.POST("/matching/find", handleFindMatches)
+	r.POST("/post/create", handleCreatePost)
+	r.GET("/post/type/:type", handleGetPostsByType)
+
 	r.Run(":8080")
 }
 
@@ -402,6 +407,250 @@ func handleClassifyMessage(c *gin.Context) {
 	}
 
 	c.JSON(http.StatusOK, gin.H{"success": true})
+}
+
+// handleFindMatches finds potential matches based on post content
+func handleFindMatches(c *gin.Context) {
+	var req struct {
+		Content  string `json:"content" binding:"required"`
+		Page     int    `json:"page"`
+		PageSize int    `json:"pageSize"`
+	}
+
+	if err := c.ShouldBindJSON(&req); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "Invalid request", "detail": err.Error()})
+		return
+	}
+
+	// Default pagination values
+	if req.Page < 1 {
+		req.Page = 1
+	}
+
+	if req.PageSize < 1 || req.PageSize > 50 {
+		req.PageSize = 10
+	}
+
+	ctx := context.Background()
+
+	// First classify the content to extract structured information
+	postInfo, err := ClassifyPost(ctx, req.Content)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to classify post content", "detail": err.Error()})
+		return
+	}
+
+	// Use the classified information to find matching posts
+	matchResults, total, err := GetMatchingPosts(ctx, mongoDB, req.Content, req.Page, req.PageSize)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to find matches", "detail": err.Error()})
+		return
+	}
+
+	c.JSON(http.StatusOK, gin.H{
+		"matches":  matchResults,
+		"total":    total,
+		"page":     req.Page,
+		"pageSize": req.PageSize,
+		"postInfo": postInfo, // Include the classification results
+	})
+}
+
+// handleCreatePost creates a new post with NLP classification
+func handleCreatePost(c *gin.Context) {
+	var req struct {
+		UserID  string `json:"userId" binding:"required"`
+		Content string `json:"content" binding:"required"`
+		Type    string `json:"type" binding:"required,oneof=mua ban"` // Explicit type override
+	}
+
+	if err := c.ShouldBindJSON(&req); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "Invalid request", "detail": err.Error()})
+		return
+	}
+
+	ctx := context.Background()
+
+	// Parse user ID
+	userID, err := primitive.ObjectIDFromHex(req.UserID)
+	if err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "Invalid user ID"})
+		return
+	}
+
+	// Verify user exists
+	var user User
+	err = userCollection.FindOne(ctx, bson.M{"_id": userID}).Decode(&user)
+	if err != nil {
+		if err == mongo.ErrNoDocuments {
+			c.JSON(http.StatusNotFound, gin.H{"error": "User not found"})
+		} else {
+			c.JSON(http.StatusInternalServerError, gin.H{"error": "Database error"})
+		}
+		return
+	}
+
+	// Classify post content using NLP
+	postInfo, err := ClassifyPost(ctx, req.Content)
+	if err != nil {
+		log.Printf("Warning: Failed to classify post: %v", err)
+		// Continue anyway, using user-provided type
+		postInfo = &PostInfo{
+			Type:     req.Type,
+			Category: "", // Empty fields will be filled by frontend
+		}
+	} else {
+		// Override the NLP classification type with user's explicit choice if provided
+		postInfo.Type = req.Type
+	}
+
+	// Create and save the post
+	post := Post{
+		ID:        primitive.NewObjectID(),
+		Type:      postInfo.Type,
+		Content:   req.Content,
+		UserID:    userID,
+		CreatedAt: time.Now(),
+		Category:  postInfo.Category,
+		Location:  postInfo.Location,
+		Price:     postInfo.Price,
+		Condition: postInfo.Condition,
+		Keywords:  postInfo.Keywords,
+	}
+
+	result, err := InsertPost(ctx, mongoDB, post)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to create post", "detail": err.Error()})
+		return
+	}
+
+	// Index the post in Elasticsearch for matching
+	if ElasticClient != nil {
+		// Create a mock message to index the post content
+		msg := Message{
+			ID:        primitive.NewObjectID(),
+			Content:   req.Content,
+			CreatedAt: time.Now(),
+		}
+
+		// Index in Elasticsearch
+		if err := IndexChatMessage(ctx, msg, nil, &post); err != nil {
+			log.Printf("Warning: Error indexing post in Elasticsearch: %v", err)
+			// Continue anyway, as Elasticsearch indexing should not block the API response
+		}
+	}
+
+	c.JSON(http.StatusOK, gin.H{
+		"post":       post,
+		"insertedID": result.InsertedID,
+		"postInfo":   postInfo,
+	})
+}
+
+// handleGetPostsByType retrieves posts by type (mua/ban)
+func handleGetPostsByType(c *gin.Context) {
+	postType := c.Param("type")
+	if postType != "mua" && postType != "ban" {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "Invalid post type. Must be 'mua' or 'ban'"})
+		return
+	}
+
+	// Pagination
+	page, _ := strconv.Atoi(c.DefaultQuery("page", "1"))
+	if page < 1 {
+		page = 1
+	}
+
+	pageSize, _ := strconv.Atoi(c.DefaultQuery("pageSize", "10"))
+	if pageSize < 1 || pageSize > 100 {
+		pageSize = 10
+	}
+
+	// Filter options
+	category := c.Query("category")
+	location := c.Query("location")
+	minPrice, _ := strconv.Atoi(c.DefaultQuery("minPrice", "0"))
+	maxPrice, _ := strconv.Atoi(c.DefaultQuery("maxPrice", "0"))
+
+	// Build filter
+	filter := bson.M{"type": postType}
+
+	if category != "" {
+		filter["category"] = category
+	}
+
+	if location != "" {
+		filter["location"] = location
+	}
+
+	if minPrice > 0 || maxPrice > 0 {
+		priceFilter := bson.M{}
+		if minPrice > 0 {
+			priceFilter["$gte"] = minPrice
+		}
+		if maxPrice > 0 {
+			priceFilter["$lte"] = maxPrice
+		}
+		filter["price"] = priceFilter
+	}
+
+	// Options for sorting and pagination
+	findOptions := options.Find().
+		SetSort(bson.M{"createdAt": -1}).
+		SetSkip(int64((page - 1) * pageSize)).
+		SetLimit(int64(pageSize))
+
+	// Execute query
+	ctx := context.Background()
+	cursor, err := postCollection.Find(ctx, filter, findOptions)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Database error", "detail": err.Error()})
+		return
+	}
+	defer cursor.Close(ctx)
+
+	// Get results
+	var posts []Post
+	if err := cursor.All(ctx, &posts); err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Error parsing results", "detail": err.Error()})
+		return
+	}
+
+	// Get total count for pagination
+	total, err := postCollection.CountDocuments(ctx, filter)
+	if err != nil {
+		log.Printf("Warning: Error counting posts: %v", err)
+		total = 0
+	}
+
+	// For each post, get user info
+	type PostWithUser struct {
+		Post Post `json:"post"`
+		User User `json:"user,omitempty"`
+	}
+
+	result := make([]PostWithUser, 0, len(posts))
+	for _, post := range posts {
+		item := PostWithUser{
+			Post: post,
+		}
+
+		// Get user
+		var user User
+		err := userCollection.FindOne(ctx, bson.M{"_id": post.UserID}).Decode(&user)
+		if err == nil {
+			item.User = user
+		}
+
+		result = append(result, item)
+	}
+
+	c.JSON(http.StatusOK, gin.H{
+		"posts":    result,
+		"total":    total,
+		"page":     page,
+		"pageSize": pageSize,
+	})
 }
 
 // ClassifyPost sử dụng OpenAI để phân tích nội dung tin đăng

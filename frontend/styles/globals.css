@@ -1,0 +1,33 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+@layer components {
+  .btn {
+    @apply px-4 py-2 rounded-md transition-colors duration-200 font-medium focus:outline-none focus:ring-2 focus:ring-opacity-50;
+  }
+  
+  .btn-primary {
+    @apply btn bg-primary hover:bg-indigo-700 text-white focus:ring-indigo-500;
+  }
+
+  .btn-secondary {
+    @apply btn bg-secondary hover:bg-green-700 text-white focus:ring-green-500;
+  }
+  
+  .input {
+    @apply w-full px-4 py-2 border border-gray-300 rounded-md focus:outline-none focus:ring-2 focus:ring-primary focus:border-transparent;
+  }
+  
+  .chat-bubble {
+    @apply rounded-lg px-4 py-2 max-w-[80%] mb-2;
+  }
+  
+  .chat-bubble-user {
+    @apply chat-bubble bg-primary text-white self-end;
+  }
+  
+  .chat-bubble-other {
+    @apply chat-bubble bg-light text-dark self-start;
+  }
+}

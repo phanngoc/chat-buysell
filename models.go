@@ -93,6 +93,13 @@ type ChatMessageIndex struct {
 	MessageType string    `json:"message_type"`        // "question", "negotiation", "agreement", etc.
 }
 
+// MatchingResult represents a matching post result with score
+type MatchingResult struct {
+	Post  Post    `json:"post"`
+	User  User    `json:"user"`
+	Score float64 `json:"score"`
+}
+
 // ElasticClient holds the Elasticsearch client
 var ElasticClient *elasticsearch.Client
 
@@ -375,6 +382,258 @@ func ClassifyChatMessage(ctx context.Context, msgID string, messageType string) 
 	}
 	
 	return nil
+}
+
+// SearchMatchingPosts searches for matching posts based on post information
+// If postType is "mua", it will search for "ban" posts and vice versa
+func SearchMatchingPosts(ctx context.Context, postInfo *PostInfo, page, pageSize int) ([]MatchingResult, int, error) {
+	if ElasticClient == nil {
+		return nil, 0, fmt.Errorf("Elasticsearch client not initialized")
+	}
+	
+	// Determine opposite post type for matching
+	oppositeType := "mua"
+	if postInfo.Type == "mua" {
+		oppositeType = "ban"
+	}
+	
+	// Calculate from for pagination
+	from := (page - 1) * pageSize
+	
+	// Build a query that matches on multiple fields with different weights
+	// We'll use should clauses to boost matching on important fields
+	searchQuery := map[string]interface{}{
+		"query": map[string]interface{}{
+			"bool": map[string]interface{}{
+				"must": []map[string]interface{}{
+					{
+						"term": map[string]interface{}{
+							"post_type": oppositeType,
+						},
+					},
+				},
+				"should": []map[string]interface{}{},
+			},
+		},
+		"from": from,
+		"size": pageSize,
+	}
+	
+	// Add should clauses for boosting relevant matches
+	shouldClauses := []map[string]interface{}{}
+	
+	// Match on category with high boost
+	if postInfo.Category != "" {
+		shouldClauses = append(shouldClauses, map[string]interface{}{
+			"term": map[string]interface{}{
+				"category": map[string]interface{}{
+					"value": postInfo.Category,
+					"boost": 3.0,
+				},
+			},
+		})
+	}
+	
+	// Match on location
+	if postInfo.Location != "" {
+		shouldClauses = append(shouldClauses, map[string]interface{}{
+			"term": map[string]interface{}{
+				"location": map[string]interface{}{
+					"value": postInfo.Location,
+					"boost": 2.0,
+				},
+			},
+		})
+	}
+	
+	// Match on condition
+	if postInfo.Condition != "" {
+		shouldClauses = append(shouldClauses, map[string]interface{}{
+			"term": map[string]interface{}{
+				"condition": map[string]interface{}{
+					"value": postInfo.Condition,
+					"boost": 1.5,
+				},
+			},
+		})
+	}
+	
+	// Match on price range (if specified)
+	if postInfo.Price > 0 {
+		// For buying posts looking for selling posts, we want price <= the max the buyer is willing to pay
+		// For selling posts looking for buying posts, we want price >= the min the seller is asking
+		var priceQuery map[string]interface{}
+		
+		if postInfo.Type == "mua" {
+			// Buyer looking for sellers, want prices less than or equal
+			priceQuery = map[string]interface{}{
+				"range": map[string]interface{}{
+					"price": map[string]interface{}{
+						"lte": postInfo.Price,
+						// Allow some flexibility in price (about 10% higher)
+						"gte": int(float64(postInfo.Price) * 0.5),
+					},
+				},
+			}
+		} else {
+			// Seller looking for buyers, want prices greater than or equal
+			priceQuery = map[string]interface{}{
+				"range": map[string]interface{}{
+					"price": map[string]interface{}{
+						"gte": postInfo.Price,
+						// Allow some flexibility (about 50% higher)
+						"lte": int(float64(postInfo.Price) * 1.5),
+					},
+				},
+			}
+		}
+		
+		shouldClauses = append(shouldClauses, priceQuery)
+	}
+	
+	// Match on keywords
+	if len(postInfo.Keywords) > 0 {
+		keywordsQuery := map[string]interface{}{
+			"terms": map[string]interface{}{
+				"keywords": map[string]interface{}{
+					"terms": postInfo.Keywords,
+					"boost": 2.0,
+				},
+			},
+		}
+		shouldClauses = append(shouldClauses, keywordsQuery)
+		
+		// Also search in content field for similar terms
+		for _, keyword := range postInfo.Keywords {
+			contentQuery := map[string]interface{}{
+				"match": map[string]interface{}{
+					"content": map[string]interface{}{
+						"query": keyword,
+						"boost": 1.0,
+					},
+				},
+			}
+			shouldClauses = append(shouldClauses, contentQuery)
+		}
+	}
+	
+	// Add should clauses to query
+	searchQuery["query"].(map[string]interface{})["bool"].(map[string]interface{})["should"] = shouldClauses
+	
+	// Must have at least one should clause match
+	if len(shouldClauses) > 0 {
+		searchQuery["query"].(map[string]interface{})["bool"].(map[string]interface{})["minimum_should_match"] = 1
+	}
+	
+	// Convert to JSON
+	data, err := json.Marshal(searchQuery)
+	if err != nil {
+		return nil, 0, fmt.Errorf("error marshaling search query: %w", err)
+	}
+	
+	// Perform the search
+	res, err := ElasticClient.Search(
+		ElasticClient.Search.WithContext(ctx),
+		ElasticClient.Search.WithIndex("chat_messages"),
+		ElasticClient.Search.WithBody(bytes.NewReader(data)),
+		ElasticClient.Search.WithTrackTotalHits(true),
+	)
+	if err != nil {
+		return nil, 0, fmt.Errorf("error searching: %w", err)
+	}
+	defer res.Body.Close()
+	
+	if res.IsError() {
+		return nil, 0, fmt.Errorf("error searching: %s", res.String())
+	}
+	
+	// Parse the response
+	var result map[string]interface{}
+	if err := json.NewDecoder(res.Body).Decode(&result); err != nil {
+		return nil, 0, fmt.Errorf("error parsing search response: %w", err)
+	}
+	
+	// Extract total hits
+	total := int(result["hits"].(map[string]interface{})["total"].(map[string]interface{})["value"].(float64))
+	
+	// Extract hits
+	hits := result["hits"].(map[string]interface{})["hits"].([]interface{})
+	matchResults := make([]MatchingResult, 0, len(hits))
+	
+	// Process each hit
+	for _, hit := range hits {
+		source := hit.(map[string]interface{})["_source"].(map[string]interface{})
+		score := hit.(map[string]interface{})["_score"].(float64)
+		
+		var chatMsg ChatMessageIndex
+		// Convert to ChatMessageIndex
+		data, err := json.Marshal(source)
+		if err != nil {
+			return nil, 0, fmt.Errorf("error marshaling hit source: %w", err)
+		}
+		
+		if err := json.Unmarshal(data, &chatMsg); err != nil {
+			return nil, 0, fmt.Errorf("error unmarshaling hit source: %w", err)
+		}
+		
+		// Skip if there's no post ID
+		if chatMsg.PostID == "" {
+			continue
+		}
+		
+		// Create a partial result with the score
+		matchResult := MatchingResult{
+			Score: score,
+		}
+		
+		// We'll fill in Post and User details later
+		
+		matchResults = append(matchResults, matchResult)
+	}
+	
+	return matchResults, total, nil
+}
+
+// GetMatchingPosts finds matching posts for the given post content
+// It first classifies the content, then searches for matching posts
+func GetMatchingPosts(ctx context.Context, db *mongo.Database, content string, page, pageSize int) ([]MatchingResult, int, error) {
+	// First, classify the post content
+	postInfo, err := ClassifyPost(ctx, content)
+	if err != nil {
+		return nil, 0, fmt.Errorf("error classifying post: %w", err)
+	}
+	
+	// Now find matching posts in Elasticsearch
+	matchResults, total, err := SearchMatchingPosts(ctx, postInfo, page, pageSize)
+	if err != nil {
+		return nil, 0, fmt.Errorf("error searching matching posts: %w", err)
+	}
+	
+	// Get details for each match from MongoDB
+	for i := range matchResults {
+		if i < len(matchResults) {
+			// Get post details
+			postID, err := primitive.ObjectIDFromHex(matchResults[i].Post.ID.Hex())
+			if err == nil {
+				var post Post
+				err = db.Collection("posts").FindOne(ctx, bson.M{"_id": postID}).Decode(&post)
+				if err == nil {
+					matchResults[i].Post = post
+				}
+			}
+			
+			// Get user details
+			if !matchResults[i].Post.UserID.IsZero() {
+				var user User
+				err = db.Collection("users").FindOne(ctx, bson.M{"_id": matchResults[i].Post.UserID}).Decode(&user)
+				if err == nil {
+					matchResults[i].User = user
+				}
+			}
+		}
+	}
+	
+	return matchResults, total, nil
 }
 
 // Example: insert user

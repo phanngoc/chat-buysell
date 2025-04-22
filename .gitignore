@@ -48,3 +48,4 @@ config.local.*
 
 # Dependencies that should be installed via go mod
 /pkg/mod/
+./frontend/node_modules/
