@@ -1,0 +1,50 @@
+# Go specific
+*.exe
+*.exe~
+*.dll
+*.so
+*.dylib
+*.test
+*.out
+/vendor/
+
+# Go workspace file
+go.work
+
+# Docker related
+*.env
+.env
+
+# IDE specific files
+.idea/
+.vscode/
+*.swp
+*.swo
+.DS_Store
+
+# Binary output directories
+/bin/
+/dist/
+
+# Local development configurations
+*.local.yml
+*.local.yaml
+config.local.*
+
+# Log files
+*.log
+/logs/
+
+# Temporary files
+/tmp/
+/temp/
+
+# Coverage reports
+/coverage/
+*.cover
+
+# SQLite databases
+*.db
+
+# Dependencies that should be installed via go mod
+/pkg/mod/
