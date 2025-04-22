@@ -6,6 +6,7 @@ import { useAuth } from './AuthContext';
 export default function SearchResults({ results, onClose, onChatRoomCreated }) {
   const { user } = useAuth();
   const [isLoading, setIsLoading] = useState(false);
+  const [loadingItemId, setLoadingItemId] = useState(null);
   const router = useRouter();
 
   // Create a chat room between buyer and seller
@@ -17,6 +18,7 @@ export default function SearchResults({ results, onClose, onChatRoomCreated }) {
 
     try {
       setIsLoading(true);
+      setLoadingItemId(result.post.id);
       
       // Determine if the current user is buyer or seller
       const isBuyer = user.type === 'buyer' || result.post.type === 'ban';
@@ -39,6 +41,7 @@ export default function SearchResults({ results, onClose, onChatRoomCreated }) {
       alert('Failed to create chat room. Please try again.');
     } finally {
       setIsLoading(false);
+      setLoadingItemId(null);
     }
   };
 
@@ -64,7 +67,11 @@ export default function SearchResults({ results, onClose, onChatRoomCreated }) {
         ) : (
           <div>
             {results.map((result) => (
-              <div key={result.post.id} className="p-4 border-b border-gray-100 hover:bg-gray-50">
+              <div 
+                key={result.post.id}
+                onClick={() => createChatRoom(result)}
+                className={`p-4 border-b border-gray-100 hover:bg-gray-50 cursor-pointer ${loadingItemId === result.post.id ? 'opacity-70' : ''}`}
+              >
                 <div className="flex items-start">
                   {result.user.avatar && (
                     <img 
@@ -100,17 +107,16 @@ export default function SearchResults({ results, onClose, onChatRoomCreated }) {
                         </span>
                       )}
                     </div>
-                    <div className="mt-3 flex items-center justify-between">
+                    <div className="mt-3 flex justify-between items-center">
                       <div className="text-xs text-gray-500">
                         Score: {Math.round(result.score * 100)}% match
                       </div>
-                      <button
-                        onClick={() => createChatRoom(result)}
-                        disabled={isLoading}
-                        className="text-sm bg-primary hover:bg-indigo-700 text-white px-3 py-1 rounded-md"
-                      >
-                        {isLoading ? 'Creating...' : 'Start Chat'}
-                      </button>
+                      {loadingItemId === result.post.id && (
+                        <span className="text-xs text-primary flex items-center">
+                          <div className="animate-spin mr-1 h-3 w-3 border border-primary border-t-transparent rounded-full"></div>
+                          Creating chat...
+                        </span>
+                      )}
                     </div>
                   </div>
                 </div>
